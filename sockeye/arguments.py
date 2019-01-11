@@ -778,6 +778,7 @@ def add_batch_args(params, default_batch_size=4096):
                              "number of sentences varies. Default: %(default)s.")
 
 
+
 def add_training_args(params):
     train_params = params.add_argument_group("Training parameters")
 
@@ -1143,7 +1144,7 @@ def add_inference_args(params):
 
     decode_params.add_argument(C.INFERENCE_ARG_INPUT_LONG, C.INFERENCE_ARG_INPUT_SHORT,
                                default=None,
-                               help='Input file to translate. One sentence per line. '
+                               help='****!!!!**** Input file to translate. One sentence per line. '
                                     'If not given, will read from stdin.')
 
     decode_params.add_argument(C.INFERENCE_ARG_INPUT_FACTORS_LONG, C.INFERENCE_ARG_INPUT_FACTORS_SHORT,
@@ -1282,6 +1283,213 @@ def add_inference_args(params):
                                type=str,
                                help='EXPERIMENTAL: may be changed or removed in future. Overrides training dtype of '
                                     'encoders and decoders during inference. Default: %(default)s')
+    decode_params.add_argument('--inference-adapt',
+                               default=False,
+                               action='store_true',
+                               help='Update model parameters toward nearest neighbors of test input segment.'
+                                    'Default: %(default)s.')
+
+def add_inference_adapt_args(params):
+    # TODO: refactor to reuse train args adding function without collision over batch size with translate batch size
+    train_params = params.add_argument_group("Training parameters")
+
+    train_params.add_argument('--min-updates',
+                              type=int,
+                              default=None,
+                              help='Minimum number of updates before training can stop. Default: %(default)s.')
+    train_params.add_argument('--max-updates',
+                              type=int,
+                              default=None,
+                              help='Maximum number of updates. Default: %(default)s.')
+    train_params.add_argument('--min-samples',
+                              type=int,
+                              default=None,
+                              help='Minimum number of samples before training can stop. Default: %(default)s.')
+    train_params.add_argument('--max-samples',
+                              type=int,
+                              default=None,
+                              help='Maximum number of samples. Default: %(default)s.')
+    train_params.add_argument('--min-num-epochs',
+                              type=int,
+                              default=None,
+                              help='Minimum number of epochs (passes through the training data) '
+                                   'before training can stop. Default: %(default)s.')
+    train_params.add_argument('--max-num-epochs',
+                              type=int,
+                              default=None,
+                              help='Maximum number of epochs (passes through the training data) Default: %(default)s.')
+    train_params.add_argument('--gradient-clipping-threshold',
+                              type=float,
+                              default=1.0,
+                              help='Clip absolute gradients values greater than this value. '
+                                   'Set to negative to disable. Default: %(default)s.')
+    train_params.add_argument('--gradient-clipping-type',
+                              choices=C.GRADIENT_CLIPPING_TYPES,
+                              default=C.GRADIENT_CLIPPING_TYPE_NONE,
+                              help='The type of gradient clipping. Default: %(default)s.')
+    train_params.add_argument('--momentum',
+                              type=float,
+                              default=None,
+                              help='Momentum constant. Default: %(default)s.')
+    train_params.add_argument('--loss-normalization-type',
+                              default=C.LOSS_NORM_VALID,
+                              choices=[C.LOSS_NORM_VALID, C.LOSS_NORM_BATCH],
+                              help='How to normalize the loss. By default loss is normalized by the number '
+                                   'of valid (non-PAD) tokens (%s).' % C.LOSS_NORM_VALID)
+    train_params.add_argument('--optimizer',
+                              default=C.OPTIMIZER_ADAM,
+                              choices=C.OPTIMIZERS,
+                              help='SGD update rule. Default: %(default)s.')
+    train_params.add_argument('--optimizer-params',
+                              type=simple_dict(),
+                              default=None,
+                              help='Additional optimizer params as dictionary. Format: key1:value1,key2:value2,...')
+    train_params.add_argument('--optimized-metric',
+                              default=C.PERPLEXITY,
+                              choices=C.METRICS,
+                              help='Metric to optimize with early stopping {%(choices)s}. Default: %(default)s.')
+    train_params.add_argument('--metrics',
+                              nargs='+',
+                              default=[C.PERPLEXITY],
+                              choices=[C.PERPLEXITY, C.ACCURACY],
+                              help='Names of metrics to track on training and validation data. Default: %(default)s.')
+    train_params.add_argument('--initial-learning-rate',
+                              type=float,
+                              default=0.0002,
+                              help='Initial learning rate. Default: %(default)s.')
+    train_params.add_argument('--weight-decay',
+                              type=float,
+                              default=0.0,
+                              help='Weight decay constant. Default: %(default)s.')
+    train_params.add_argument('--weight-init',
+                              type=str,
+                              default=C.INIT_XAVIER,
+                              choices=C.INIT_TYPES,
+                              help='Type of base weight initialization. Default: %(default)s.')
+    train_params.add_argument('--weight-init-scale',
+                              type=float,
+                              default=3.0,
+                              help='Weight initialization scale. Applies to uniform (scale) and xavier (magnitude). '
+                                   'Default: %(default)s.')
+    train_params.add_argument('--weight-init-xavier-factor-type',
+                              type=str,
+                              default=C.INIT_XAVIER_FACTOR_TYPE_AVG,
+                              choices=C.INIT_XAVIER_FACTOR_TYPES,
+                              help='Xavier factor type. Default: %(default)s.')
+    train_params.add_argument('--weight-init-xavier-rand-type',
+                              type=str,
+                              default=C.RAND_TYPE_UNIFORM,
+                              choices=[C.RAND_TYPE_UNIFORM, C.RAND_TYPE_GAUSSIAN],
+                              help='Xavier random number generator type. Default: %(default)s.')
+    train_params.add_argument('--embed-weight-init',
+                              type=str,
+                              default=C.EMBED_INIT_DEFAULT,
+                              choices=C.EMBED_INIT_TYPES,
+                              help='Type of embedding matrix weight initialization. If normal, initializes embedding '
+                                   'weights using a normal distribution with std=1/srqt(vocab_size). '
+                                   'Default: %(default)s.')
+    train_params.add_argument('--rnn-h2h-init', type=str, default=C.RNN_INIT_ORTHOGONAL,
+                              choices=[C.RNN_INIT_ORTHOGONAL, C.RNN_INIT_ORTHOGONAL_STACKED, C.RNN_INIT_DEFAULT],
+                              help="Initialization method for RNN parameters. Default: %(default)s.")
+    train_params.add_argument('--learning-rate-scheduler-type',
+                              default=C.LR_SCHEDULER_PLATEAU_REDUCE,
+                              choices=C.LR_SCHEDULERS,
+                              help='Learning rate scheduler type. Default: %(default)s.')
+    train_params.add_argument('--learning-rate-reduce-factor',
+                              type=float,
+                              default=0.7,
+                              help="Factor to multiply learning rate with "
+                                   "(for 'plateau-reduce' learning rate scheduler). Default: %(default)s.")
+    train_params.add_argument('--learning-rate-reduce-num-not-improved',
+                              type=int,
+                              default=8,
+                              help="For 'plateau-reduce' learning rate scheduler. Adjust learning rate "
+                                   "if <optimized-metric> did not improve for x checkpoints. Default: %(default)s.")
+    train_params.add_argument('--learning-rate-half-life',
+                              type=float,
+                              default=10,
+                              help="Half-life of learning rate in checkpoints. For 'fixed-rate-*' "
+                                   "learning rate schedulers. Default: %(default)s.")
+    train_params.add_argument('--learning-rate-schedule',
+                              type=learning_schedule(),
+                              default=None,
+                              help="For 'fixed-step' scheduler. Fully specified learning schedule in the form"
+                                   " \"rate1:num_updates1[,rate2:num_updates2,...]\". Overrides all other args related"
+                                   " to learning rate and stopping conditions. Default: %(default)s.")
+    train_params.add_argument('--learning-rate-warmup',
+                              type=int,
+                              default=0,
+                              help="Number of warmup steps. If set to x, linearly increases learning rate from 10%% "
+                                   "to 100%% of the initial learning rate. Default: %(default)s.")
+    train_params.add_argument('--learning-rate-decay-param-reset',
+                              action='store_true',
+                              help='Resets model parameters to current best when learning rate is reduced due to the '
+                                   'value of --learning-rate-reduce-num-not-improved. Default: %(default)s.')
+    train_params.add_argument('--learning-rate-decay-optimizer-states-reset',
+                              choices=C.LR_DECAY_OPT_STATES_RESET_CHOICES,
+                              default=C.LR_DECAY_OPT_STATES_RESET_OFF,
+                              help="Action to take on optimizer states (e.g. Adam states) when learning rate is "
+                                   "reduced due to the value of --learning-rate-reduce-num-not-improved. "
+                                   "Default: %(default)s.")
+
+    train_params.add_argument('--rnn-forget-bias',
+                              default=0.0,
+                              type=float,
+                              help='Initial value of RNN forget biases.')
+
+    train_params.add_argument('--fixed-param-names',
+                              default=[],
+                              nargs='*',
+                              help="Names of parameters to fix at training time. Default: %(default)s.")
+
+    train_params.add_argument(C.TRAIN_ARGS_MONITOR_BLEU,
+                              default=500,
+                              type=int,
+                              help='x>0: decode x sampled sentences from validation data and '
+                                   'compute evaluation metrics. x==-1: use full validation data. Default: %(default)s.')
+    train_params.add_argument('--decode-and-evaluate-use-cpu',
+                              action='store_true',
+                              help='Use CPU for decoding validation data. Overrides --decode-and-evaluate-device-id. '
+                                   'Default: %(default)s.')
+    train_params.add_argument('--decode-and-evaluate-device-id',
+                              default=None,
+                              type=int,
+                              help='Separate device for decoding validation data. '
+                                   'Use a negative number to automatically acquire a GPU. '
+                                   'Use a positive number to acquire a specific GPU. Default: %(default)s.')
+
+    train_params.add_argument('--seed',
+                              type=int,
+                              default=13,
+                              help='Random seed. Default: %(default)s.')
+
+    train_params.add_argument('--keep-last-params',
+                              type=int,
+                              default=-1,
+                              help='Keep only the last n params files, use -1 to keep all files. Default: %(default)s')
+
+    train_params.add_argument('--dry-run',
+                              action='store_true',
+                              help="Do not perform any actual training, but print statistics about the model"
+                              " and mode of operation.")
+    train_params.add_argument("--kvstore",
+                              type=str,
+                              default=C.KVSTORE_DEVICE,
+                              choices=C.KVSTORE_TYPES,
+                              help="The MXNet kvstore to use. 'device' is recommended for single process training. "
+                                   "Use any of 'dist_sync', 'dist_device_sync' and 'dist_async' for distributed "
+                                   "training. Default: %(default)s.")
+    train_params.add_argument("--gradient-compression-type",
+                              type=str,
+                              default=C.GRADIENT_COMPRESSION_NONE,
+                              choices=C.GRADIENT_COMPRESSION_TYPES,
+                              help='Type of gradient compression to use. Default: %(default)s.')
+    train_params.add_argument("--gradient-compression-threshold",
+                              type=float,
+                              default=0.5,
+                              help="Threshold for gradient compression if --gctype is '2bit'. Default: %(default)s.")
+
+
 
 
 def add_evaluate_args(params):

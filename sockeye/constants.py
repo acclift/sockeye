@@ -197,6 +197,10 @@ JSON_FACTORS_KEY = "factors"
 JSON_CONSTRAINTS_KEY = "constraints"
 JSON_AVOID_KEY = "avoid"
 JSON_ENCODING = "utf-8"
+JSON_NEIGHBORS_KEY = "neighbors"
+JSON_NEIGHBOR_SRC_KEY = "neighbor_src"
+JSON_NEIGHBOR_TGT_KEY = "neighbor_tgt"
+JSON_NEIGHBOR_SCORE_KEY = "neighbor_score"
 
 # Lexical constraints
 BANK_ADJUSTMENT = 'even'

@@ -866,6 +866,92 @@ def get_training_data_iters(sources: List[str],
 
     return train_iter, validation_iter, config_data, data_info
 
+def get_adapt_data_iters(sources: List[str],
+                            target: str,
+                            source_vocabs: List[vocab.Vocab],
+                            target_vocab: vocab.Vocab,
+                            shared_vocab: bool,
+                            batch_size: int,
+                            batch_by_words: bool,
+                            batch_num_devices: int,
+                            fill_up: str,
+                            max_seq_len_source: int,
+                            max_seq_len_target: int,
+                            bucketing: bool,
+                            bucket_width: int,
+                            permute: bool = False) -> Tuple['BaseParallelSampleIter',
+                                                           Optional['BaseParallelSampleIter'],
+                                                           'DataConfig', 'DataInfo']:
+    """
+    Returns data iterators for training and validation data.
+
+    :param sources: Path to source training data (with optional factor data paths).
+    :param target: Path to target training data.
+    :param validation_sources: Path to source validation data (with optional factor data paths).
+    :param validation_target: Path to target validation data.
+    :param source_vocabs: Source vocabulary and optional factor vocabularies.
+    :param target_vocab: Target vocabulary.
+    :param shared_vocab: Whether the vocabularies are shared.
+    :param batch_size: Batch size.
+    :param batch_by_words: Size batches by words rather than sentences.
+    :param batch_num_devices: Number of devices batches will be parallelized across.
+    :param fill_up: Fill-up policy for buckets.
+    :param max_seq_len_source: Maximum source sequence length.
+    :param max_seq_len_target: Maximum target sequence length.
+    :param bucketing: Whether to use bucketing.
+    :param bucket_width: Size of buckets.
+    :return: Tuple of (training data iterator, validation data iterator, data config).
+    """
+    logger.info("===============================")
+    logger.info("Creating adapt data iterator")
+    logger.info("===============================")
+    # Pass 1: get target/source length ratios.
+    length_statistics = analyze_sequence_lengths(sources, target, source_vocabs, target_vocab,
+                                                 max_seq_len_source, max_seq_len_target)
+    # define buckets
+    buckets = define_parallel_buckets(max_seq_len_source, max_seq_len_target, bucket_width,
+                                      length_statistics.length_ratio_mean) if bucketing else [
+        (max_seq_len_source, max_seq_len_target)]
+
+    sources_sentences, target_sentences = create_sequence_readers(sources, target, source_vocabs, target_vocab)
+
+    # Pass 2: Get data statistics and determine the number of data points for each bucket.
+    data_statistics = get_data_statistics(sources_sentences, target_sentences, buckets,
+                                          length_statistics.length_ratio_mean, length_statistics.length_ratio_std,
+                                          source_vocabs, target_vocab)
+
+    bucket_batch_sizes = define_bucket_batch_sizes(buckets,
+                                                   batch_size,
+                                                   batch_by_words,
+                                                   batch_num_devices,
+                                                   data_statistics.average_len_target_per_bucket)
+
+    data_statistics.log(bucket_batch_sizes)
+
+    # Pass 3: Load the data into memory and return the iterator.
+    data_loader = RawParallelDatasetLoader(buckets=buckets,
+                                           eos_id=target_vocab[C.EOS_SYMBOL],
+                                           pad_id=C.PAD_ID)
+
+    training_data = data_loader.load(sources_sentences, target_sentences,
+                                     data_statistics.num_sents_per_bucket).fill_up(bucket_batch_sizes, fill_up)
+
+    config_data = DataConfig(data_statistics=data_statistics,
+                             max_seq_len_source=max_seq_len_source,
+                             max_seq_len_target=max_seq_len_target,
+                             num_source_factors=len(sources),
+                             source_with_eos=True)
+
+    train_iter = ParallelSampleIter(data=training_data,
+                                    buckets=buckets,
+                                    batch_size=batch_size,
+                                    bucket_batch_sizes=bucket_batch_sizes,
+                                    num_factors=len(sources),
+                                    permute=permute)
+
+
+    return train_iter, config_data
+
 
 class LengthStatistics(config.Config):
 
@@ -1702,3 +1788,103 @@ class ParallelSampleIter(BaseParallelSampleIter):
             self.data_permutations.append(permutation)
 
         self.data = self.data.permute(self.data_permutations)
+
+class ParallelIter(BaseParallelSampleIter):
+    """
+    Data iterator on a bucketed ParallelDataSet. Does not shuffle data or support saving and loading the
+    iterator state, so that access to training data can be deterministic.
+    """
+
+    def __init__(self,
+                 data: ParallelDataSet,
+                 buckets,
+                 batch_size,
+                 bucket_batch_sizes,
+                 source_data_name=C.SOURCE_NAME,
+                 target_data_name=C.TARGET_NAME,
+                 label_name=C.TARGET_LABEL_NAME,
+                 num_factors: int = 1,
+                 permute: bool = False,
+                 dtype='float32') -> None:
+        super().__init__(buckets=buckets, batch_size=batch_size, bucket_batch_sizes=bucket_batch_sizes,
+                         source_data_name=source_data_name, target_data_name=target_data_name,
+                         label_name=label_name, num_factors=num_factors, permute=permute, dtype=dtype)
+
+        # create independent lists to be shuffled
+        self.data = ParallelDataSet(list(data.source), list(data.target), list(data.label))
+
+        # create index tuples (buck_idx, batch_start_pos) into buckets.
+        # This is the list of all batches across all buckets in the dataset. These will be shuffled.
+        self.batch_indices = get_batch_indices(self.data, bucket_batch_sizes)
+        self.curr_batch_index = 0
+
+        self.reset()
+
+    def reset(self):
+        """
+        Resets the data.
+        """
+        self.curr_batch_index = 0
+
+    def iter_next(self) -> bool:
+        """
+        True if iterator can return another batch
+        """
+        return self.curr_batch_index != len(self.batch_indices)
+
+    def next(self) -> mx.io.DataBatch:
+        """
+        Returns the next batch from the data iterator.
+        """
+        if not self.iter_next():
+            raise StopIteration
+
+        i, j = self.batch_indices[self.curr_batch_index]
+        self.curr_batch_index += 1
+
+        batch_size = self.bucket_batch_sizes[i].batch_size
+        source = self.data.source[i][j:j + batch_size]
+        target = self.data.target[i][j:j + batch_size]
+        data = [source, target]
+        label = [self.data.label[i][j:j + batch_size]]
+
+        provide_data = [mx.io.DataDesc(name=n, shape=x.shape, layout=C.BATCH_MAJOR) for n, x in
+                        zip(self.data_names, data)]
+        provide_label = [mx.io.DataDesc(name=n, shape=x.shape, layout=C.BATCH_MAJOR) for n, x in
+                         zip(self.label_names, label)]
+
+        # TODO: num pad examples is not set here if fillup policy would be padding
+        return mx.io.DataBatch(data, label,
+                               pad=0, index=None, bucket_key=self.buckets[i],
+                               provide_data=provide_data, provide_label=provide_label)
+
+def batchify_neighbors(neigbors: List[Tuple(str, str)]) -> mx.io.DataBatch:
+    """
+    Turns the set of nearest neighbors for each sentence in the batch into a training batch.
+    need:
+    default bucket key
+    source
+    target
+    label
+    Probably best to make this an additional function belonging to ParallelIter
+    using a ParallelDataSet,
+    that isn't an iterator, just assumes it makes and returns a single batch.
+    Use ParallelIter.next as template.
+    """
+
+    data = [source, target]
+
+    source_data_name = C.SOURCE_NAME
+    target_data_name = C.TARGET_NAME
+    data_names = [source_data_name, target_data_name]
+    label_names = C.TARGET_LABEL_NAME
+
+    provide_data = [mx.io.DataDesc(name=n, shape=x.shape, layout=C.BATCH_MAJOR) for n, x in
+                    zip(data_names, data)]
+    provide_label = [mx.io.DataDesc(name=n, shape=x.shape, layout=C.BATCH_MAJOR) for n, x in
+                     zip(label_names, label)]
+
+    # TODO: num pad examples is not set here if fillup policy would be padding
+    return mx.io.DataBatch(data, label,
+                           pad=0, index=None, bucket_key=default_bucket_key,
+                           provide_data=provide_data, provide_label=provide_label)

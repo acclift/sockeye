@@ -21,14 +21,17 @@ from contextlib import ExitStack
 from math import ceil
 from typing import Generator, Optional, List
 
+import mxnet as mx
+
 from sockeye.lexicon import TopKLexicon
 from sockeye.log import setup_main_logger
-from sockeye.output_handler import get_output_handler, OutputHandler
 from sockeye.utils import determine_context, log_basic_info, check_condition, grouper
+from sockeye.output_handler import get_output_handler, OutputHandler
 from . import arguments
 from . import constants as C
 from . import data_io
 from . import inference
+from . import inference_adapt_train
 
 logger = setup_main_logger(__name__, file_logging=False)
 
@@ -36,6 +39,7 @@ logger = setup_main_logger(__name__, file_logging=False)
 def main():
     params = arguments.ConfigArgumentParser(description='Translate CLI')
     arguments.add_translate_cli_args(params)
+    arguments.add_inference_adapt_args(params)
     args = params.parse_args()
     run_translate(args)
 
@@ -93,6 +97,29 @@ def run_translate(args: argparse.Namespace):
             restrict_lexicon = TopKLexicon(source_vocabs[0], target_vocab)
             restrict_lexicon.load(args.restrict_lexicon, k=args.restrict_lexicon_topk)
         store_beam = args.output_type == C.OUTPUT_HANDLER_BEAM_STORE
+
+        inference_adapt_model = None
+        if args.inference_adapt:
+            model = models[0] # for now, just use the first of the loaded models
+            bucketing = True # for now, just set this here; modify decode CLI args later
+            model_config = model.config
+            default_bucket_key = (model_config.config_data.max_seq_len_source, model_config.config_data.max_seq_len_target)
+            provide_data = [mx.io.DataDesc(name=C.SOURCE_NAME,
+                           shape=(args.batch_size, default_bucket_key[0], model_config.config_data.num_source_factors),
+                           layout=C.BATCH_MAJOR),
+            mx.io.DataDesc(name=C.TARGET_NAME,
+                           shape=(args.batch_size, default_bucket_key[1]),
+                           layout=C.BATCH_MAJOR)]
+            provide_label = [mx.io.DataDesc(name=C.TARGET_LABEL_NAME,
+                           shape=(args.batch_size, default_bucket_key[1]),
+                           layout=C.BATCH_MAJOR)]
+            inference_adapt_model = inference_adapt_train.create_inference_adapt_model(config=model_config,
+                                                                       context=context,
+                                                                       provide_data=provide_data,
+                                                                       provide_label=provide_label,
+                                                                       default_bucket_key=default_bucket_key,
+                                                                       bucketing=bucketing,
+                                                                       args=args)
         translator = inference.Translator(context=context,
                                           ensemble_mode=args.ensemble_mode,
                                           bucket_source_width=args.bucket_width,
@@ -103,11 +130,13 @@ def run_translate(args: argparse.Namespace):
                                           models=models,
                                           source_vocabs=source_vocabs,
                                           target_vocab=target_vocab,
+                                          inference_adapt_model=inference_adapt_model,
                                           restrict_lexicon=restrict_lexicon,
                                           avoid_list=args.avoid_list,
                                           store_beam=store_beam,
                                           strip_unknown_words=args.strip_unknown_words,
-                                          skip_topk=args.skip_topk)
+                                          skip_topk=args.skip_topk,
+                                          adapt_args=args)
         read_and_translate(translator=translator,
                            output_handler=output_handler,
                            chunk_size=args.chunk_size,
@@ -132,10 +161,12 @@ def make_inputs(input_file: Optional[str],
     :param input_factors: Source factor files.
     :return: TranslatorInput objects.
     """
+    logger.info("**************************** making translator input ****************************")
     if input_file is None:
         check_condition(input_factors is None, "Translating from STDIN, not expecting any factor files.")
         for sentence_id, line in enumerate(sys.stdin, 1):
             if input_is_json:
+                logger.info("making translator input from json string")
                 yield inference.make_input_from_json_string(sentence_id=sentence_id, json_string=line)
             else:
                 yield inference.make_input_from_factored_string(sentence_id=sentence_id,
@@ -152,6 +183,7 @@ def make_inputs(input_file: Optional[str],
             streams = [exit_stack.enter_context(data_io.smart_open(i)) for i in inputs]
             for sentence_id, inputs in enumerate(zip(*streams), 1):
                 if input_is_json:
+                    logger.info("making translator input from json string")
                     yield inference.make_input_from_json_string(sentence_id=sentence_id, json_string=inputs[0])
                 else:
                     yield inference.make_input_from_multiple_strings(sentence_id=sentence_id, strings=list(inputs))
@@ -215,7 +247,7 @@ def translate(output_handler: OutputHandler,
     :return: Total time taken.
     """
     tic = time.time()
-    trans_outputs = translator.translate(trans_inputs)
+    trans_outputs = translator.simple_translate(trans_inputs)
     total_time = time.time() - tic
     batch_time = total_time / len(trans_inputs)
     for trans_input, trans_output in zip(trans_inputs, trans_outputs):

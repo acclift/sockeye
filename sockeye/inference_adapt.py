@@ -28,7 +28,7 @@ import mxnet as mx
 import numpy as np
 from math import sqrt
 
-from . import checkpoint_decoder
+#from . import checkpoint_decoder
 from . import constants as C
 from . import data_io
 from . import loss
@@ -39,53 +39,6 @@ from . import vocab
 from .optimizers import BatchState, CheckpointState, SockeyeOptimizer, OptimizerConfig
 
 logger = logging.getLogger(__name__)
-
-class InferenceAdaptModel(model.SockeyeModel):
-    """
-    InferenceAdaptModel is a SockeyeModel that fully unrolls over source and target sequences.
-    It's a lighterweight version of a TrainingModel that's just used for inference-time updates to a previously trained model.
-
-    :param config: Configuration object holding details about the model.
-    :param context: The context(s) that MXNet will be run in (GPU(s)/CPU).
-    :param provide_data: List of input data descriptions.
-    :param provide_label: List of label descriptions.
-    :param default_bucket_key: Default bucket key.
-    :param bucketing: If True bucketing will be used, if False the computation graph will always be
-            unrolled to the full length.
-    :param gradient_compression_params: Optional dictionary of gradient compression parameters.
-    :param fixed_param_names: Optional list of params to fix during training (i.e. their values will not be trained).
-    """
-
-    def __init__(self,
-                 config: model.ModelConfig,
-                 context: List[mx.context.Context],
-                 default_bucket_key: Tuple[int, int],
-                 bucketing: bool,
-                 gradient_compression_params: Optional[Dict[str, Any]] = None,
-                 fixed_param_names: Optional[List[str]] = None) -> None:
-        super().__init__(config)
-        self.context = context
-        self.fixed_param_names = fixed_param_names
-        self._bucketing = bucketing
-        self._gradient_compression_params = gradient_compression_params
-        self._initialize(default_bucket_key)
-        self._monitor = None  # type: Optional[mx.monitor.Monitor]
-    def _initialize(self, default_bucket_key: Tuple[int, int]):
-        """
-        Initializes model components, creates training symbol and module, and binds it.
-        """
-        source = mx.sym.Variable(C.SOURCE_NAME)
-        source_words = source.split(num_outputs=self.config.config_embed_source.num_factors,
-                                    axis=2, squeeze_axis=True)[0]
-        source_length = utils.compute_lengths(source_words)
-        target = mx.sym.Variable(C.TARGET_NAME)
-        target_length = utils.compute_lengths(target)
-        labels = mx.sym.reshape(data=mx.sym.Variable(C.TARGET_LABEL_NAME), shape=(-1,))
-
-        self.model_loss = loss.get_loss(self.config.config_loss)
-
-        data_names = [C.SOURCE_NAME, C.TARGET_NAME]
-        label_names = [C.TARGET_LABEL_NAME]
 
 
 
@@ -481,18 +434,14 @@ class EarlyStoppingTrainer:
         self.model = model
         self.optimizer_config = optimizer_config
         self.max_params_files_to_keep = max_params_files_to_keep
-        self.tflogger = TensorboardLogger(logdir=os.path.join(model.output_dir, C.TENSORBOARD_NAME),
-                                          source_vocab=source_vocabs[0],
-                                          target_vocab=target_vocab)
         self.state = None  # type: Optional[TrainState]
 
     def fit(self,
-            train_iter: data_io.BaseParallelSampleIter,
-            validation_iter: data_io.BaseParallelSampleIter,
+            next_data_batch: data_io.BaseParallelSampleIter,
             early_stopping_metric,
             metrics: List[str],
-            checkpoint_frequency: int,
-            max_num_not_improved: int,
+#            checkpoint_frequency: int,
+#            max_num_not_improved: int,
             min_samples: Optional[int] = None,
             max_samples: Optional[int] = None,
             min_updates: Optional[int] = None,
@@ -501,7 +450,7 @@ class EarlyStoppingTrainer:
             max_epochs: Optional[int] = None,
             lr_decay_param_reset: bool = False,
             lr_decay_opt_states_reset: str = C.LR_DECAY_OPT_STATES_RESET_OFF,
-            decoder: Optional[checkpoint_decoder.CheckpointDecoder] = None,
+  #          decoder: Optional[checkpoint_decoder.CheckpointDecoder] = None,
             mxmonitor_pattern: Optional[str] = None,
             mxmonitor_stat_func: Optional[str] = None,
             allow_missing_parameters: bool = False,
@@ -540,32 +489,32 @@ class EarlyStoppingTrainer:
 
         :return: Best score on validation data observed during training.
         """
-        self._check_args(metrics, early_stopping_metric, lr_decay_opt_states_reset, lr_decay_param_reset, decoder)
-        logger.info("Early stopping by optimizing '%s'", early_stopping_metric)
+        #self._check_args(metrics, early_stopping_metric, lr_decay_opt_states_reset, lr_decay_param_reset, decoder)
+        #logger.info("Early stopping by optimizing '%s'", early_stopping_metric)
 
         self._initialize_parameters(existing_parameters, allow_missing_parameters)
         self._initialize_optimizer()
 
-        resume_training = os.path.exists(self.training_state_dirname)
-        if resume_training:
-            logger.info("Found partial training in '%s'. Resuming from saved state.", self.training_state_dirname)
-            utils.check_condition('dist' not in self.optimizer_config.kvstore,
-                                  "Training continuation not supported with distributed training.")
-            self._load_training_state(train_iter)
-        else:
-            self.state = TrainState(early_stopping_metric)
-            self._save_params()
-            self._update_best_params_link()
-            self._save_training_state(train_iter)
-            self._update_best_optimizer_states(lr_decay_opt_states_reset)
-            self.tflogger.log_graph(self.model.current_module.symbol)
-            logger.info("Training started.")
+        #resume_training = os.path.exists(self.training_state_dirname)
+        #if resume_training:
+        #    logger.info("Found partial training in '%s'. Resuming from saved state.", self.training_state_dirname)
+        #    utils.check_condition('dist' not in self.optimizer_config.kvstore,
+        #                          "Training continuation not supported with distributed training.")
+        #    #self._load_training_state(train_iter)
+        #else:
+        self.state = TrainState(early_stopping_metric)
+        #self._save_params()
+        #self._update_best_params_link()
+        #self._save_training_state(train_iter)
+        self._update_best_optimizer_states(lr_decay_opt_states_reset)
+        #self.tflogger.log_graph(self.model.current_module.symbol)
+        logger.info("Training started.")
 
         metric_train, metric_val, metric_loss = self._create_metrics(metrics, self.model.optimizer, self.model.loss)
 
         process_manager = None
-        if decoder is not None:
-            process_manager = DecoderProcessManager(self.model.output_dir, decoder=decoder)
+        #if decoder is not None:
+        #    process_manager = DecoderProcessManager(self.model.output_dir, decoder=decoder)
 
         if mxmonitor_pattern is not None:
             self.model.install_monitor(mxmonitor_pattern, mxmonitor_stat_func)
@@ -573,7 +522,7 @@ class EarlyStoppingTrainer:
         speedometer = Speedometer(frequency=C.MEASURE_SPEED_EVERY, auto_reset=False)
         tic = time.time()
 
-        next_data_batch = train_iter.next()
+        #next_data_batch = train_iter.next()
         while True:
 
             if max_epochs is not None and self.state.epoch == max_epochs:
@@ -592,21 +541,25 @@ class EarlyStoppingTrainer:
             # STEP
             ######
             batch = next_data_batch
-            self._step(self.model, batch, checkpoint_frequency, metric_train, metric_loss)
+            logger.info("***************************************************************************")
+            logger.info("Running round of inference updates: '%i'.", self.state.updates)
+            logger.info("***************************************************************************")
+            self._step(self.model, batch, metric_train, metric_loss)
             batch_num_samples = batch.data[0].shape[0]
             batch_num_tokens = batch.data[0].shape[1] * batch_num_samples
             self.state.updates += 1
             self.state.samples += batch_num_samples
+            self.state.epoch += 1
 
-            if not train_iter.iter_next():
-                self.state.epoch += 1
-                train_iter.reset()
+            #if not train_iter.iter_next():
+            #    self.state.epoch += 1
+            #    train_iter.reset()
 
-            next_data_batch = train_iter.next()
-            self.model.prepare_batch(next_data_batch)
+            #next_data_batch = train_iter.next()
+            #self.model.prepare_batch(next_data_batch)
 
             speedometer(self.state.epoch, self.state.updates, batch_num_samples, batch_num_tokens, metric_train)
-
+            '''
             ############
             # CHECKPOINT
             ############
@@ -620,9 +573,9 @@ class EarlyStoppingTrainer:
                             self.state.samples, time_cost, checkpoint_frequency / time_cost)
                 for name, val in metric_train.get_name_value():
                     logger.info('Checkpoint [%d]\tTrain-%s=%f', self.state.checkpoint, name, val)
-                self._evaluate(validation_iter, metric_val)
-                for name, val in metric_val.get_name_value():
-                    logger.info('Checkpoint [%d]\tValidation-%s=%f', self.state.checkpoint, name, val)
+ #               self._evaluate(validation_iter, metric_val)
+ #               for name, val in metric_val.get_name_value():
+ #                   logger.info('Checkpoint [%d]\tValidation-%s=%f', self.state.checkpoint, name, val)
 
                 # (3) update training metrics
                 self._update_metrics(metric_train, metric_val, process_manager)
@@ -630,6 +583,7 @@ class EarlyStoppingTrainer:
 
                 # (4) determine improvement
                 has_improved = False
+                
                 previous_best = self.state.best_metric
                 for checkpoint, metric_dict in enumerate(self.state.metrics, 1):
                     value = metric_dict.get("%s-val" % early_stopping_metric, self.state.best_metric)
@@ -658,12 +612,12 @@ class EarlyStoppingTrainer:
                             m_val = val
                     checkpoint_state = CheckpointState(checkpoint=self.state.checkpoint, metric_val=m_val)
                     self.model.optimizer.pre_update_checkpoint(checkpoint_state)
-
+                
                 # (5) adjust learning rates
                 self._adjust_learning_rate(has_improved, lr_decay_param_reset, lr_decay_opt_states_reset)
 
                 # (6) save training state
-                self._save_training_state(train_iter)
+                #self._save_training_state(train_iter)
 
                 # (7) determine stopping
                 if 0 <= max_num_not_improved <= self.state.num_not_improved:
@@ -687,6 +641,7 @@ class EarlyStoppingTrainer:
 
                     if stop_fit:
                         break
+                
 
                 tic = time.time()
 
@@ -694,11 +649,11 @@ class EarlyStoppingTrainer:
         logger.info("Training finished. Best checkpoint: %d. Best validation %s: %.6f",
                     self.state.best_checkpoint, early_stopping_metric, self.state.best_metric)
         return self.state.best_metric
+        '''
 
     def _step(self,
               model: TrainingModel,
               batch: mx.io.DataBatch,
-              checkpoint_frequency: int,
               metric_train: mx.metric.EvalMetric,
               metric_loss: Optional[mx.metric.EvalMetric] = None):
         """
@@ -717,10 +672,10 @@ class EarlyStoppingTrainer:
         # Gradient rescaling
         ####################
         gradient_norm = None
-        if self.state.updates > 0 and (self.state.updates + 1) % checkpoint_frequency == 0:
-            # compute values for logging to metrics (before rescaling...)
-            gradient_norm = self.state.gradient_norm = model.get_global_gradient_norm()
-            self.state.gradients = model.get_gradients()
+        #if self.state.updates > 0 and (self.state.updates + 1) % checkpoint_frequency == 0:
+        #    # compute values for logging to metrics (before rescaling...)
+        #    gradient_norm = self.state.gradient_norm = model.get_global_gradient_norm()
+        #    self.state.gradients = model.get_gradients()
 
         # note: C.GRADIENT_CLIPPING_TYPE_ABS is handled by the mxnet optimizer directly
         if self.optimizer_config.gradient_clipping_type == C.GRADIENT_CLIPPING_TYPE_NORM:
@@ -762,8 +717,8 @@ class EarlyStoppingTrainer:
 
     def _update_metrics(self,
                         metric_train: mx.metric.EvalMetric,
-                        metric_val: mx.metric.EvalMetric,
-                        process_manager: Optional['DecoderProcessManager'] = None):
+                        metric_val: mx.metric.EvalMetric):
+                        #process_manager: Optional['DecoderProcessManager'] = None):
         """
         Updates metrics for current checkpoint. If a process manager is given, also collects previous decoding results
         and spawns a new decoding process.
@@ -783,11 +738,11 @@ class EarlyStoppingTrainer:
 
         if process_manager is not None:
             result = process_manager.collect_results()
-            if result is not None:
-                decoded_checkpoint, decoder_metrics = result
-                self.state.metrics[decoded_checkpoint - 1].update(decoder_metrics)
-                self.tflogger.log_metrics(decoder_metrics, decoded_checkpoint)
-            process_manager.start_decoder(self.state.checkpoint)
+            #if result is not None:
+            #    decoded_checkpoint, decoder_metrics = result
+            #    self.state.metrics[decoded_checkpoint - 1].update(decoder_metrics)
+            #    self.tflogger.log_metrics(decoder_metrics, decoded_checkpoint)
+            #process_manager.start_decoder(self.state.checkpoint)
 
         self.state.metrics.append(checkpoint_metrics)
         utils.write_metrics_file(self.state.metrics, self.metrics_fname)
@@ -795,9 +750,10 @@ class EarlyStoppingTrainer:
         tf_metrics = checkpoint_metrics.copy()
         tf_metrics.update({"%s_grad" % n: v for n, v in self.state.gradients.items()})
         tf_metrics.update(self.model.params)
-        self.tflogger.log_metrics(metrics=tf_metrics, checkpoint=self.state.checkpoint)
+        #self.tflogger.log_metrics(metrics=tf_metrics, checkpoint=self.state.checkpoint)
 
-    def _cleanup(self, lr_decay_opt_states_reset: str, process_manager: Optional['DecoderProcessManager'] = None):
+    '''
+    def _cleanup(self, lr_decay_opt_states_reset: str):#, process_manager: Optional['DecoderProcessManager'] = None):
         """
         Cleans parameter files, training state directory and waits for remaining decoding processes.
         """
@@ -806,9 +762,9 @@ class EarlyStoppingTrainer:
         if process_manager is not None:
             result = process_manager.collect_results()
             if result is not None:
-                decoded_checkpoint, decoder_metrics = result
-                self.state.metrics[decoded_checkpoint - 1].update(decoder_metrics)
-                self.tflogger.log_metrics(decoder_metrics, decoded_checkpoint)
+                #decoded_checkpoint, decoder_metrics = result
+                #self.state.metrics[decoded_checkpoint - 1].update(decoder_metrics)
+                #self.tflogger.log_metrics(decoder_metrics, decoded_checkpoint)
             utils.write_metrics_file(self.state.metrics, self.metrics_fname)
 
         final_training_state_dirname = os.path.join(self.model.output_dir, C.TRAINING_STATE_DIRNAME)
@@ -818,6 +774,7 @@ class EarlyStoppingTrainer:
             best_opt_states_fname = os.path.join(self.model.output_dir, C.OPT_STATES_BEST)
             if os.path.exists(best_opt_states_fname):
                 os.remove(best_opt_states_fname)
+    '''
 
     def _initialize_parameters(self, params: Optional[str], allow_missing_params: bool):
         self.model.initialize_parameters(self.optimizer_config.initializer, allow_missing_params)
@@ -852,20 +809,12 @@ class EarlyStoppingTrainer:
                     self.model.load_optimizer_states(os.path.join(self.model.output_dir, C.OPT_STATES_BEST))
 
     @property
-    def best_params_fname(self) -> str:
-        return os.path.join(self.model.output_dir, C.PARAMS_BEST_NAME)
-
-    @property
     def current_params_fname(self) -> str:
         return os.path.join(self.model.output_dir, C.PARAMS_NAME % self.state.checkpoint)
 
     @property
     def metrics_fname(self) -> str:
         return os.path.join(self.model.output_dir, C.METRICS_NAME)
-
-    @property
-    def training_state_dirname(self) -> str:
-        return os.path.join(self.model.output_dir, C.TRAINING_STATE_DIRNAME)
 
     @staticmethod
     def _create_eval_metric(metric_name: str) -> mx.metric.EvalMetric:
@@ -904,15 +853,15 @@ class EarlyStoppingTrainer:
             metric_loss = None
         return metric_train, metric_val, metric_loss
 
-    def _update_best_params_link(self):
-        """
-        Updates the params.best link to the latest best parameter file.
-        """
-        best_params_path = self.best_params_fname
-        actual_best_params_fname = C.PARAMS_NAME % self.state.best_checkpoint
-        if os.path.lexists(best_params_path):
-            os.remove(best_params_path)
-        os.symlink(actual_best_params_fname, best_params_path)
+ #   def _update_best_params_link(self):
+ #       """
+ #       Updates the params.best link to the latest best parameter file.
+ #       """
+ #       best_params_path = self.best_params_fname
+ #       actual_best_params_fname = C.PARAMS_NAME % self.state.best_checkpoint
+ #       if os.path.lexists(best_params_path):
+ #           os.remove(best_params_path)
+ #       os.symlink(actual_best_params_fname, best_params_path)
 
     def _update_best_optimizer_states(self, lr_decay_opt_states_reset: str):
         if lr_decay_opt_states_reset == C.LR_DECAY_OPT_STATES_RESET_BEST:
@@ -926,8 +875,8 @@ class EarlyStoppingTrainer:
                     metrics: List[str],
                     early_stopping_metric: str,
                     lr_decay_opt_states_reset: str,
-                    lr_decay_param_reset: bool,
-                    cp_decoder: Optional[checkpoint_decoder.CheckpointDecoder] = None):
+                    lr_decay_param_reset: bool):
+                    #cp_decoder: Optional[checkpoint_decoder.CheckpointDecoder] = None):
         """
         Helper function that checks various configuration compatibilities.
         """
@@ -956,8 +905,8 @@ class EarlyStoppingTrainer:
 
         utils.check_condition(early_stopping_metric in C.METRICS,
                               "Unsupported early-stopping metric: %s" % early_stopping_metric)
-        if early_stopping_metric in C.METRICS_REQUIRING_DECODER:
-            utils.check_condition(cp_decoder is not None, "%s requires CheckpointDecoder" % early_stopping_metric)
+        #if early_stopping_metric in C.METRICS_REQUIRING_DECODER:
+        #    utils.check_condition(cp_decoder is not None, "%s requires CheckpointDecoder" % early_stopping_metric)
 
     def _save_params(self):
         """
@@ -1152,7 +1101,7 @@ class Speedometer:
             self.init = True
             self.tic = time.time()
 
-
+'''
 class DecoderProcessManager(object):
     """
     Thin wrapper around a CheckpointDecoder instance to start non-blocking decodes and collect the results.
@@ -1225,3 +1174,4 @@ def _decode_and_evaluate(decoder: checkpoint_decoder.CheckpointDecoder,
     """
     metrics = decoder.decode_and_evaluate(checkpoint, output_name)
     queue.put((checkpoint, metrics))
+'''

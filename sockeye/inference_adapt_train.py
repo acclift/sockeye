@@ -25,20 +25,19 @@ from typing import Any, cast, Optional, Dict, List, Tuple
 import mxnet as mx
 
 from . import arguments
-from . import checkpoint_decoder
 from . import constants as C
 from . import convolution
 from . import coverage
 from . import data_io
 from . import decoder
 from . import encoder
+from . import inference_adapt
 from . import initializer
 from . import loss
 from . import lr_scheduler
 from . import model
 from . import rnn
 from . import rnn_attention
-from . import training
 from . import transformer
 from . import utils
 from . import vocab
@@ -151,45 +150,6 @@ def check_resume(args: argparse.Namespace, output_folder: str) -> bool:
 
     return resume_training
 
-
-def create_checkpoint_decoder(args: argparse.Namespace,
-                              exit_stack: ExitStack,
-                              train_context: List[mx.Context]) -> Optional[checkpoint_decoder.CheckpointDecoder]:
-    """
-    Returns a checkpoint decoder or None.
-
-    :param args: Arguments as returned by argparse.
-    :param exit_stack: An ExitStack from contextlib.
-    :param train_context: Context for training.
-    :return: A CheckpointDecoder if --decode-and-evaluate != 0, else None.
-    """
-    sample_size = args.decode_and_evaluate
-    if args.optimized_metric == C.BLEU and sample_size == 0:
-        logger.info("You chose BLEU as the optimized metric, will turn on BLEU monitoring during training. "
-                    "To control how many validation sentences are used for calculating bleu use "
-                    "the --decode-and-evaluate argument.")
-        sample_size = -1
-
-    if sample_size == 0:
-        return None
-
-    if args.use_cpu or args.decode_and_evaluate_use_cpu:
-        context = mx.cpu()
-    elif args.decode_and_evaluate_device_id is not None:
-        context = utils.determine_context(device_ids=args.decode_and_evaluate_device_id,
-                                          use_cpu=False,
-                                          disable_device_locking=args.disable_device_locking,
-                                          lock_dir=args.lock_dir,
-                                          exit_stack=exit_stack)[0]
-    else:
-        # default decode context is the last training device
-        context = train_context[-1]
-
-    return checkpoint_decoder.CheckpointDecoder(context=context,
-                                                inputs=[args.validation_source] + args.validation_source_factors,
-                                                references=args.validation_target,
-                                                model=args.output,
-                                                sample_size=sample_size)
 
 
 def use_shared_vocab(args: argparse.Namespace) -> bool:
@@ -652,40 +612,13 @@ def create_model_config(args: argparse.Namespace,
     return model_config
 
 
-def create_training_model(config: model.ModelConfig,
-                          context: List[mx.Context],
-                          output_dir: str,
-                          train_iter: data_io.BaseParallelSampleIter,
-                          args: argparse.Namespace) -> training.TrainingModel:
-    """
-    Create a training model and load the parameters from disk if needed.
-
-    :param config: The configuration for the model.
-    :param context: The context(s) to run on.
-    :param output_dir: Output folder.
-    :param train_iter: The training data iterator.
-    :param args: Arguments as returned by argparse.
-    :return: The training model.
-    """
-    training_model = training.TrainingModel(config=config,
-                                            context=context,
-                                            output_dir=output_dir,
-                                            provide_data=train_iter.provide_data,
-                                            provide_label=train_iter.provide_label,
-                                            default_bucket_key=train_iter.default_bucket_key,
-                                            bucketing=not args.no_bucketing,
-                                            gradient_compression_params=gradient_compression_params(args),
-                                            fixed_param_names=args.fixed_param_names)
-
-    return training_model
-
 def create_inference_adapt_model(config: model.ModelConfig,
                                  context: List[mx.Context],
                                  provide_data: List[mx.io.DataDesc],
                                  provide_label: List[mx.io.DataDesc],
                                  default_bucket_key: Tuple[int, int],
                                  bucketing: bool,
-                                 args: argparse.Namespace) -> training.TrainingModel:
+                                 args: argparse.Namespace) -> inference_adapt.TrainingModel:
     """
     Create a training model and load the parameters from disk if needed.
 
@@ -697,7 +630,7 @@ def create_inference_adapt_model(config: model.ModelConfig,
     :return: The training model.
     """
     # TO-DO: add decoder CLI args to read in fixed param names
-    inference_adapt_model = training.TrainingModel(config=config,
+    inference_adapt_model = inference_adapt.TrainingModel(config=config,
                                             context=context,
                                             provide_data=provide_data,
                                             provide_label=provide_label,
@@ -753,6 +686,8 @@ def create_optimizer_config(args: argparse.Namespace, source_vocab_sizes: List[i
     # Manually specified params
     if args.optimizer_params:
         optimizer_params.update(args.optimizer_params)
+    # TODO: remove need for this
+    checkpoint_frequency = 10
 
     weight_init = initializer.get_initializer(default_init_type=args.weight_init,
                                               default_init_scale=args.weight_init_scale,
@@ -764,7 +699,7 @@ def create_optimizer_config(args: argparse.Namespace, source_vocab_sizes: List[i
                                               extra_initializers=extra_initializers)
 
     lr_sched = lr_scheduler.get_lr_scheduler(args.learning_rate_scheduler_type,
-                                             args.checkpoint_frequency,
+                                             checkpoint_frequency, #TODO: remove need for this
                                              none_if_negative(args.learning_rate_half_life),
                                              args.learning_rate_reduce_factor,
                                              args.learning_rate_reduce_num_not_improved,
@@ -884,7 +819,7 @@ def train(args: argparse.Namespace):
             min_epochs = None
             max_epochs = None
 
-        trainer = training.EarlyStoppingTrainer(model=training_model,
+        trainer = inference_adapt.EarlyStoppingTrainer(model=training_model,
                                                 optimizer_config=create_optimizer_config(args, source_vocab_sizes),
                                                 max_params_files_to_keep=args.keep_last_params,
                                                 source_vocabs=source_vocabs,
@@ -894,8 +829,6 @@ def train(args: argparse.Namespace):
                     validation_iter=eval_iter,
                     early_stopping_metric=args.optimized_metric,
                     metrics=args.metrics,
-                    checkpoint_frequency=args.checkpoint_frequency,
-                    max_num_not_improved=max_num_checkpoint_not_improved,
                     min_samples=min_samples,
                     max_samples=max_samples,
                     min_updates=min_updates,
@@ -904,7 +837,7 @@ def train(args: argparse.Namespace):
                     max_epochs=max_epochs,
                     lr_decay_param_reset=args.learning_rate_decay_param_reset,
                     lr_decay_opt_states_reset=args.learning_rate_decay_optimizer_states_reset,
-                    decoder=create_checkpoint_decoder(args, exit_stack, context),
+                    #decoder=create_checkpoint_decoder(args, exit_stack, context),
                     mxmonitor_pattern=args.monitor_pattern,
                     mxmonitor_stat_func=args.monitor_stat_func,
                     allow_missing_parameters=args.allow_missing_params or model_config.lhuc,

@@ -14,6 +14,7 @@
 """
 Code for inference/translation
 """
+import argparse
 import itertools
 import json
 import logging
@@ -33,6 +34,8 @@ from . import lexicon
 from . import model
 from . import utils
 from . import vocab
+from . import inference_adapt
+from . import inference_adapt_train
 from .log import is_python34
 
 logger = logging.getLogger(__name__)
@@ -90,6 +93,8 @@ class InferenceModel(model.SockeyeModel):
         self.decoder_module = None  # type: Optional[mx.mod.BucketingModule]
         self.decoder_default_bucket_key = None  # type: Optional[Tuple[int, int]]
         self.decoder_return_logit_inputs = decoder_return_logit_inputs
+        self.training_module = None # type: Optional[mx.mod.BucketingModule]
+        self.training_module_bucket_key = None # type: Optional[int]
 
         self.cache_output_layer_w_b = cache_output_layer_w_b
         self.output_layer_w = None  # type: Optional[mx.nd.NDArray]
@@ -138,6 +143,7 @@ class InferenceModel(model.SockeyeModel):
         self.decoder_module.bind(data_shapes=max_decoder_data_shapes, for_training=False, grad_req="null")
 
         self.load_params_from_file(self.params_fname)
+        # for dynamic adaptation, don't copy to enc/dec here, rather copy updated params after adapting
         self.encoder_module.init_params(arg_params=self.params, aux_params=self.aux_params, allow_missing=False)
         self.decoder_module.init_params(arg_params=self.params, aux_params=self.aux_params, allow_missing=False)
 
@@ -360,6 +366,15 @@ class InferenceModel(model.SockeyeModel):
     def source_with_eos(self) -> bool:
         return self.config.config_data.source_with_eos
 
+def extract_config_and_vocabs(model_folder: str):
+    model_source_vocabs = vocab.load_source_vocabs(model_folder)
+    model_target_vocab = vocab.load_target_vocab(model_folder)
+
+    model_version = utils.load_version(os.path.join(model_folder, C.VERSION_NAME))
+    logger.info("Model version: %s", model_version)
+    utils.check_version(model_version)
+    model_config = model.SockeyeModel.load_config(os.path.join(model_folder, C.CONFIG_NAME))
+    return model_config, model_source_vocabs, model_target_vocab
 
 def load_models(context: mx.context.Context,
                 max_input_len: Optional[int],
@@ -372,8 +387,7 @@ def load_models(context: mx.context.Context,
                 decoder_return_logit_inputs: bool = False,
                 cache_output_layer_w_b: bool = False,
                 forced_max_output_len: Optional[int] = None,
-                override_dtype: Optional[str] = None) -> Tuple[List[InferenceModel],
-                                                               List[vocab.Vocab],
+                override_dtype: Optional[str] = None) -> Tuple[List[InferenceModel], List[vocab.Vocab],
                                                                vocab.Vocab]:
     """
     Loads a list of models for inference.
@@ -413,15 +427,9 @@ def load_models(context: mx.context.Context,
         skip_softmax = False
 
     for model_folder, checkpoint in zip(model_folders, checkpoints):
-        model_source_vocabs = vocab.load_source_vocabs(model_folder)
-        model_target_vocab = vocab.load_target_vocab(model_folder)
+        model_config, model_source_vocabs, model_target_vocab = extract_config_and_vocabs(model_folder)
         source_vocabs.append(model_source_vocabs)
         target_vocabs.append(model_target_vocab)
-
-        model_version = utils.load_version(os.path.join(model_folder, C.VERSION_NAME))
-        logger.info("Model version: %s", model_version)
-        utils.check_version(model_version)
-        model_config = model.SockeyeModel.load_config(os.path.join(model_folder, C.CONFIG_NAME))
         if override_dtype is not None:
             model_config.config_encoder.dtype = override_dtype
             model_config.config_decoder.dtype = override_dtype
@@ -586,6 +594,22 @@ Tokens = List[str]
 SentenceId = Union[int, str]
 
 
+SimilarTranslation = NamedTuple('SimilarTranslation', [
+    ('neighbor_src', List[Tokens]),
+    ('neighbor_tgt', List[Tokens]),
+    ('similarity', float)
+])
+"""
+Object used for dynamic adaptation.
+Contains a source-target pair of translated data,
+where the source is similar to the input test segment.
+Required for inference-time parameter updates.
+
+:param neighbor_src: Source side of nearest neighbor.
+:param neighbor_tgt: Target side of nearest neighbor.
+:param similarity: Score used to weight how much this translation influences parameter updates.
+"""
+
 class TranslatorInput:
     """
     Object required by Translator.translate().
@@ -594,25 +618,28 @@ class TranslatorInput:
     :param tokens: List of input tokens.
     :param factors: Optional list of additional factor sequences.
     :param constraints: Optional list of target-side constraints.
+    :param neighbors: Optional list of nearest-neighbor segments to the input
     """
 
-    __slots__ = ('sentence_id', 'tokens', 'factors', 'constraints', 'avoid_list')
+    __slots__ = ('sentence_id', 'tokens', 'factors', 'constraints', 'avoid_list', 'neighbors')
 
     def __init__(self,
                  sentence_id: SentenceId,
                  tokens: Tokens,
                  factors: Optional[List[Tokens]] = None,
                  constraints: Optional[List[Tokens]] = None,
-                 avoid_list: Optional[List[Tokens]] = None) -> None:
+                 avoid_list: Optional[List[Tokens]] = None,
+                 neighbors: Optional[List[SimilarTranslation]] = None) -> None:
         self.sentence_id = sentence_id
         self.tokens = tokens
         self.factors = factors
         self.constraints = constraints
         self.avoid_list = avoid_list
+        self.neighbors = neighbors
 
     def __str__(self):
-        return 'TranslatorInput(%s, %s, factors=%s, constraints=%s, avoid=%s)' \
-            % (self.sentence_id, self.tokens, self.factors, self.constraints, self.avoid_list)
+        return 'TranslatorInput(%s, %s, factors=%s, constraints=%s, avoid=%s, neighbors=%s)' \
+            % (self.sentence_id, self.tokens, self.factors, self.constraints, self.avoid_list, self.neighbors)
 
     def __len__(self):
         return len(self.tokens)
@@ -648,7 +675,8 @@ class TranslatorInput:
                                   tokens=self.tokens[i:i + chunk_size],
                                   factors=factors,
                                   constraints=constraints,
-                                  avoid_list=self.avoid_list)
+                                  avoid_list=self.avoid_list,
+                                  neighbors=self.neighbors)
 
     def with_eos(self) -> 'TranslatorInput':
         """
@@ -659,7 +687,8 @@ class TranslatorInput:
                                factors=[factor + [C.EOS_SYMBOL] for factor in
                                         self.factors] if self.factors is not None else None,
                                constraints=self.constraints,
-                               avoid_list=self.avoid_list)
+                               avoid_list=self.avoid_list,
+                               neighbors=self.neighbors)
 
 
 class BadTranslatorInput(TranslatorInput):
@@ -691,7 +720,8 @@ def make_input_from_json_string(sentence_id: SentenceId, json_string: str) -> Tr
     :param sentence_id: Sentence id.
     :param json_string: A JSON object serialized as a string that must contain a key "text", mapping to the input text,
            and optionally a key "factors" that maps to a list of strings, each of which representing a factor sequence
-           for the input text.
+           for the input text, and optionally a key "neighbors" that maps to a set of json objects representing the
+           similar translations to the test input, consisting of a source string, target string, and similarity score.
     :return: A TranslatorInput.
     """
     try:
@@ -726,7 +756,25 @@ def make_input_from_json_string(sentence_id: SentenceId, json_string: str) -> Tr
         if isinstance(constraints, list):
             constraints = [list(data_io.get_tokens(constraint)) for constraint in constraints]
 
-        return TranslatorInput(sentence_id=sentence_id, tokens=tokens, factors=factors, constraints=constraints, avoid_list=avoid_list)
+        # List of source-target examples similar to the test input
+        neighbors = None
+        json_neighbors = jobj.get(C.JSON_NEIGHBORS_KEY)
+        if isinstance(json_neighbors, list):
+            logger.info("******* it's a json neighbors instance! ********")
+            neighbors = []
+            for nn in json_neighbors:
+                logger.info("******* here's a neighbor ********")
+                src = list(data_io.get_tokens(str(nn.get(C.JSON_NEIGHBOR_SRC_KEY))))
+                tgt = list(data_io.get_tokens(str(nn.get(C.JSON_NEIGHBOR_TGT_KEY))))
+                score = nn.get(C.JSON_NEIGHBOR_SCORE_KEY)
+                neighbors.append(SimilarTranslation(src, tgt, score))
+        logger.info("******* here's all the neighbors: ********")
+        logger.info(neighbors)
+        logger.info("******* just made this Translator Input *******")
+        tr = TranslatorInput(sentence_id=sentence_id, tokens=tokens, factors=factors, constraints=constraints, avoid_list=avoid_list, neighbors=neighbors)
+        logger.info(tr)
+
+        return TranslatorInput(sentence_id=sentence_id, tokens=tokens, factors=factors, constraints=constraints, avoid_list=avoid_list, neighbors=neighbors)
 
     except Exception as e:
         logger.exception(e, exc_info=True) if not is_python34() else logger.error(e)  # type: ignore
@@ -981,11 +1029,13 @@ class Translator:
     :param models: List of models.
     :param source_vocabs: Source vocabularies.
     :param target_vocab: Target vocabulary.
+    :param inference_adapt_model: training model to update for inference-time adaptation.
     :param restrict_lexicon: Top-k lexicon to use for target vocabulary restriction.
     :param avoid_list: Global list of phrases to exclude from the output.
     :param store_beam: If True, store the beam search history and return it in the TranslatorOutput.
     :param strip_unknown_words: If True, removes any <unk> symbols from outputs.
     :param skip_topk: If True, uses argmax instead of topk for greedy decoding.
+    :param adapt_args: If not None, args to supply to inference-time parameter updating.
     """
 
     def __init__(self,
@@ -998,11 +1048,13 @@ class Translator:
                  models: List[InferenceModel],
                  source_vocabs: List[vocab.Vocab],
                  target_vocab: vocab.Vocab,
+                 inference_adapt_model: Optional[inference_adapt.TrainingModel] = None,
                  restrict_lexicon: Optional[lexicon.TopKLexicon] = None,
                  avoid_list: Optional[str] = None,
                  store_beam: bool = False,
                  strip_unknown_words: bool = False,
-                 skip_topk: bool = False) -> None:
+                 skip_topk: bool = False,
+                 adapt_args: Optional[argparse.Namespace] = None) -> None:
         self.context = context
         self.length_penalty = length_penalty
         self.beam_prune = beam_prune
@@ -1032,8 +1084,11 @@ class Translator:
             utils.check_condition(len(self.models) == 1 and self.beam_size == 1, "Skipping softmax cannot be enabled for several models, or a beam size > 1.")
 
         self.skip_topk = skip_topk
+        self.adapt_args = adapt_args
         # after models are loaded we ensured that they agree on max_input_length, max_output_length and batch size
         self._max_input_length = self.models[0].max_input_length
+        # TODO acclift: add similar checks to above
+        self.inference_adapt_model = inference_adapt_model
         if bucket_source_width > 0:
             self.buckets_source = data_io.define_buckets(self._max_input_length, step=bucket_source_width)
         else:
@@ -1221,6 +1276,8 @@ class Translator:
         # translate in batch-sized blocks over input chunks
         for batch_id, batch in enumerate(utils.grouper(input_chunks, self.batch_size)):
             logger.debug("Translating batch %d", batch_id)
+            # dynamically update model params toward test input
+
             # underfilled batch will be filled to a full batch size with copies of the 1st input
             rest = self.batch_size - len(batch)
             if rest > 0:
@@ -1251,6 +1308,134 @@ class Translator:
             results.append(self._make_result(trans_input, translation))
 
         return results
+
+    def extract_neighbors(self,
+                           trans_inputs: List[TranslatorInput]):
+
+        all_neighbors = [trans_input.translator_input.neighbors for trans_input in trans_inputs]
+        logger.info("LIST OF NEIGHBORS")
+        #logger.info(all_neighbors)
+        neighbors_tokens = [[(n.neighbor_src, n.neighbor_tgt) for n in neighbors] for neighbors in all_neighbors]
+        print(neighbors_tokens)
+        # TODO, this call is just a placeholder for the info the batchifying function will need
+        return data_io.batchify_neighbors(all_neighbors)
+
+    def simple_translate(self, trans_inputs: List[TranslatorInput]) -> List[TranslatorOutput]:
+        """
+        Translates a list of TranslatorInputs, returns a list of TranslatorOutputs.
+        Splits oversized sentences to sentence chunks of size less than max_input_length.
+
+        :param trans_inputs: List of TranslatorInputs as returned by make_input().
+        :return: List of translation results.
+        """
+        translated_chunks = []  # type: List[IndexedTranslation]
+
+        # split into chunks
+        input_chunks = []  # type: List[IndexedTranslatorInput]
+        for trans_input_idx, trans_input in enumerate(trans_inputs):
+            # bad input
+            if isinstance(trans_input, BadTranslatorInput):
+                translated_chunks.append(IndexedTranslation(input_idx=trans_input_idx, chunk_idx=0,
+                                                            translation=empty_translation()))
+            # empty input
+            elif len(trans_input.tokens) == 0:
+                translated_chunks.append(IndexedTranslation(input_idx=trans_input_idx, chunk_idx=0,
+                                                            translation=empty_translation()))
+            else:
+                # TODO(tdomhan): Remove branch without EOS with next major version bump, as future models will always be trained with source side EOS symbols
+                if self.source_with_eos:
+                    max_input_length_without_eos = self.max_input_length
+                    # oversized input
+                    if len(trans_input.tokens) > max_input_length_without_eos:
+                        logger.debug(
+                            "Input %s has length (%d) that exceeds max input length (%d). "
+                            "Splitting into chunks of size %d.",
+                            trans_input.sentence_id, len(trans_input.tokens),
+                            self.buckets_source[-1], max_input_length_without_eos)
+                        chunks = [trans_input_chunk.with_eos()
+                                  for trans_input_chunk in trans_input.chunks(max_input_length_without_eos)]
+                        input_chunks.extend([IndexedTranslatorInput(trans_input_idx, chunk_idx, chunk_input)
+                                             for chunk_idx, chunk_input in enumerate(chunks)])
+                    # regular input
+                    else:
+                        input_chunks.append(IndexedTranslatorInput(trans_input_idx,
+                                                                   chunk_idx=0,
+                                                                   translator_input=trans_input.with_eos()))
+                else:
+                    if len(trans_input.tokens) > self.max_input_length:
+                        # oversized input
+                        logger.debug(
+                            "Input %s has length (%d) that exceeds max input length (%d). "
+                            "Splitting into chunks of size %d.",
+                            trans_input.sentence_id, len(trans_input.tokens),
+                            self.buckets_source[-1], self.max_input_length)
+                        chunks = [trans_input_chunk
+                                  for trans_input_chunk in
+                                  trans_input.chunks(self.max_input_length)]
+                        input_chunks.extend([IndexedTranslatorInput(trans_input_idx, chunk_idx, chunk_input)
+                                             for chunk_idx, chunk_input in enumerate(chunks)])
+                    else:
+                        # regular input
+                        input_chunks.append(IndexedTranslatorInput(trans_input_idx,
+                                                                   chunk_idx=0,
+                                                                   translator_input=trans_input))
+
+            if trans_input.constraints is not None:
+                logger.info("Input %s has %d %s: %s", trans_input.sentence_id,
+                            len(trans_input.constraints),
+                            "constraint" if len(trans_input.constraints) == 1 else "constraints",
+                            ", ".join(" ".join(x) for x in trans_input.constraints))
+
+        # Sort longest to shortest (to rather fill batches of shorter than longer sequences)
+        input_chunks = sorted(input_chunks, key=lambda chunk: len(chunk.translator_input.tokens), reverse=True)
+
+        # translate in batch-sized blocks over input chunks
+        for batch_id, batch in enumerate(utils.grouper(input_chunks, self.batch_size)):
+        #for input_id, input_chunk in enumerate(input_chunks):
+            logger.debug("***********************************Translating batch %d", batch_id)
+            # dynamically update model params toward test input
+
+            # underfilled batch will be filled to a full batch size with copies of the 1st input
+            rest = self.batch_size - len(batch)
+            if rest > 0:
+                logger.debug("Extending the last batch to the full batch size (%d)", self.batch_size)
+                batch = batch + [batch[0]] * rest
+            translator_inputs = [indexed_translator_input.translator_input for indexed_translator_input in batch]
+            # set up a trainer do perform a round of model updates toward input's the nearest neighbors
+            training_batch = self.extract_neighbors(batch)
+            source_vocab_sizes = [len(v) for v in self.source_vocabs]
+            trainer = inference_adapt.EarlyStoppingTrainer(model=self.inference_adapt_model,
+                                                           optimizer_config=inference_adapt_train.create_optimizer_config(
+                                                           self.adapt_args, source_vocab_sizes), max_params_files_to_keep=self.adapt_args.keep_last_params,
+                                                           source_vocabs=self.source_vocabs, target_vocab=self.vocab_target)
+            trainer.fit(next_data_batch=training_batch, early_stopping_metric=self.adapt_args.optimized_metric,
+                        metrics=self.adapt_args.metrics, max_updates=self.adapt_args.max_updates)
+            # TODO: copy updated params from inference_adapt_model to the model used by decoder
+            batch_translations = self._translate_nd(*self._get_inference_input(translator_inputs))
+            # truncate to remove filler translations
+            if rest > 0:
+                batch_translations = batch_translations[:-rest]
+            for chunk, translation in zip(batch, batch_translations):
+                translated_chunks.append(IndexedTranslation(chunk.input_idx, chunk.chunk_idx, translation))
+        # Sort by input idx and then chunk id
+        translated_chunks = sorted(translated_chunks)
+
+        # Concatenate results
+        results = []  # type: List[TranslatorOutput]
+        chunks_by_input_idx = itertools.groupby(translated_chunks, key=lambda translation: translation.input_idx)
+        for trans_input, (input_idx, translations_for_input_idx) in zip(trans_inputs, chunks_by_input_idx):
+            translations_for_input_idx = list(translations_for_input_idx)  # type: ignore
+            if len(translations_for_input_idx) == 1:  # type: ignore
+                translation = translations_for_input_idx[0].translation  # type: ignore
+            else:
+                translations_to_concat = [translated_chunk.translation
+                                          for translated_chunk in translations_for_input_idx]
+                translation = self._concat_translations(translations_to_concat)
+
+            results.append(self._make_result(trans_input, translation))
+
+        return results
+
 
     def _get_inference_input(self,
                              trans_inputs: List[TranslatorInput]) -> Tuple[mx.nd.NDArray,
